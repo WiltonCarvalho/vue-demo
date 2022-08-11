@@ -1,0 +1,11 @@
+services:
+  frontend:
+    build:
+      dockerfile: ../Dockerfile.frontend
+      context: frontend
+      args:
+        BACKEND: http://172.17.0.1:8000
+    image: frontend:latest
+    ports:
+      - 8080:8080
+    network_mode: bridge

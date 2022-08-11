@@ -1,0 +1,1393 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: >-
+  Template used to create an **ECS Cluster** from the ECS Console.
+
+Metadata: 
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "VPC Config"
+        Parameters:
+          - VpcId
+          - SubnetIds
+      - Label: 
+          default: "Pipeline Configuration"
+        Parameters: 
+          - ProjectName
+          - RepositoryName
+          - RepositoryOwner
+          - RepositoryBranch
+      - Label:
+          default: "Frontend"
+        Parameters:
+          - FrontendMemory
+          # - FrontendCpu
+          - FrontendContainerImage
+      - Label:
+          default: "Backend"
+        Parameters:
+          - BackendMemory
+          # - BackendCpu
+          - BackendContainerImage
+      - Label:
+          default: "EC2 Config"
+        Parameters:
+          - ECSClusterName
+          - InstanceType
+          - RootVolumeSize
+          - AssociatePublicIpAddress
+          - LatestECSOptimizedAMI
+          - ASGDesiredSize
+          - ASGMinSize
+          - ASGMaxSize
+
+Parameters:
+  ProjectName:
+    Description: Name of the Project
+    Type: String
+    Default: my_project
+  RepositoryName:
+    Type: String
+    Default: my_repo
+    Description: Git repo
+  RepositoryBranch:
+    Description: RepositoryBranch
+    Type: String
+    Default: develop
+    AllowedValues:
+      - develop
+      - stable
+      - master
+      - main
+  RepositoryOwner:
+    Type: String
+    Default: my_user
+    Description: Github username
+  ECSClusterName:
+    Type: String
+    Description: >-
+      Specifies the ECS Cluster Name with which the resources would be
+      associated
+    Default: default
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+  SubnetIds:
+    Type: 'AWS::EC2::Subnet::Id'
+    # Type: 'List<AWS::EC2::Subnet::Id>'
+    Description: >-
+      Must be a list of at least one existing subnet. It should be residing in the selected
+      Virtual Private Cloud.
+  LatestECSOptimizedAMI:
+    Description: AMI ID
+    Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
+    Default: /aws/service/ecs/optimized-ami/amazon-linux-2/arm64/recommended/image_id
+  RootVolumeSize:
+    Type: Number
+    Description: >
+      Specifies the Size in GBs of the root EBS volume
+    Default: 40
+  InstanceType:
+    Type: String
+    Description: >
+      Specifies the EC2 instance type for your container instances.
+      X86_64: m6i.large, t3.micro | ARM64: m6g.medium, t4g.micro
+    Default: t4g.nano
+    ConstraintDescription: must be a valid EC2 instance type.
+  AssociatePublicIpAddress:
+    Type: String
+    Description: >-
+      Optional - Automatically assign public IP addresses to new instances in
+      this VPC. 
+      Requires Public Subnets in SubnetIds.
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+  ASGMinSize:
+    Type: Number
+    Description: >
+      Specifies the Min number of instances to launch and register to the cluster.
+      Defaults to 1.
+    Default: '1'
+  ASGMaxSize:
+    Type: Number
+    Description: >
+      Specifies the Max number of instances to launch and register to the cluster.
+      Defaults to 1.
+    Default: '1'
+  ASGDesiredSize:
+    Type: Number
+    Description: >
+      Specifies the Desired number of instances to launch and register to the cluster.
+      Defaults to 1.
+    Default: '1'
+  FrontendMemory:
+    Type: Number
+    Default: 64
+  # FrontendCpu:
+  #   Type: Number
+  #   Default: 512
+  FrontendContainerImage:
+    Type: String
+    Description: Registry URI
+    Default: docker.io/library/nginx:stable
+  BackendMemory:
+    Type: Number
+    Default: 64
+  # BackendCpu:
+  #   Type: Number
+  #   Default: 512
+  BackendContainerImage:
+    Type: String
+    Description: Registry URI
+    Default: docker.io/library/nginx:stable
+
+Resources:
+  ECSLaunchTemplate:
+    Type: 'AWS::EC2::LaunchTemplate'
+    DependsOn: ECSCluster
+    Properties:
+      LaunchTemplateData:
+        ImageId: !Ref LatestECSOptimizedAMI
+        InstanceType: !Ref InstanceType
+        KeyName: !Ref "AWS::NoValue"
+        IamInstanceProfile:
+          Arn: !GetAtt InstanceProfile.Arn
+        NetworkInterfaces:
+          - DeviceIndex: 0
+            AssociatePublicIpAddress: !Ref AssociatePublicIpAddress
+            Groups:
+              - !Ref SecurityGroup
+            DeleteOnTermination: true
+        BlockDeviceMappings:
+          - DeviceName: /dev/xvda
+            Ebs:
+              VolumeSize: !Ref RootVolumeSize
+              VolumeType: gp3
+              DeleteOnTermination: true
+        Monitoring: 
+          Enabled: true
+        UserData: !Base64
+          Fn::Sub: |
+            #cloud-config
+            # ssh_authorized_keys:
+            #   - ssh-rsa AAAmfr/NUJ5oE89XwPV79y3a6SnR2PuQ//99KVHWBe+eNNtbXdBbirHe6U3Ji77oW5AKtu/pNd5FSrOv6HtyqPYvgVXxH CodeBuild
+            write_files:
+              - path: /etc/sysctl.d/999-custom.conf
+                owner: root
+                content: |
+                  vm.max_map_count=524288
+                  fs.file-max=131072
+              - path: /etc/ecs/ecs.config
+                owner: root
+                content: |
+                  ECS_CLUSTER=${ECSClusterName}
+                  ECS_RESERVED_MEMORY=256
+                  ECS_ENABLE_CONTAINER_METADATA=true
+                  ECS_EXCLUDE_IPV6_PORTBINDING=true
+            runcmd:
+              - set -ex
+              - echo ECS_INSTANCE_ATTRIBUTES={\"HostName\":\"$(hostname)\"} | tee -a /etc/ecs/ecs.config
+              - sysctl -p /etc/sysctl.d/999-custom.conf
+              - |
+                tries=0
+                d_timeout=60
+                until ping -c1 us-east-1.ec2.archive.ubuntu.com >/dev/null 2>&1; do
+                  if [ "$tries" -gt "$d_timeout" ]; then
+                    echo 'Timed out waiting for networking to initialise' >&2;
+                    exit 1;
+                  fi
+                  tries=$(( $tries + 1 ));
+                  sleep 1;
+                done
+              - |
+                if $(yum --version >/dev/null 2>&1); then
+                  yum --setopt=skip_missing_names_on_install=false -y install \
+                  curl unzip
+                fi
+              - |
+                curl -fsSL https://awscli.amazonaws.com/awscli-exe-linux-$(uname -m).zip -o /tmp/awscliv2.zip
+                unzip -q /tmp/awscliv2.zip -d /opt
+                /opt/aws/install -i /usr/local/aws-cli -b /usr/local/bin --update
+                rm -rf /opt/aws /tmp/awscliv2.zip
+                aws --version
+              - |
+                AWS_AVAIL_ZONE=$(curl -fsSL http://169.254.169.254/latest/meta-data/placement/availability-zone)
+                AWS_REGION="`echo \"$AWS_AVAIL_ZONE\" | sed 's/[a-z]$//'`"
+                AWS_INSTANCE_ID=$(curl http://169.254.169.254/latest/meta-data/instance-id)
+                ROOT_VOLUME_IDS=$(aws ec2 describe-instances --region $AWS_REGION --instance-id $AWS_INSTANCE_ID --output text --query Reservations[0].Instances[0].BlockDeviceMappings[0].Ebs.VolumeId)
+                aws ec2 create-tags --resources $ROOT_VOLUME_IDS --region $AWS_REGION --tags \
+                  Key=Name,Value=$AWS_INSTANCE_ID \
+                  Key=StackName,Value=${AWS::StackName}
+
+  InstanceProfile:
+    Type: 'AWS::IAM::InstanceProfile'
+    Properties:
+      Path: /
+      Roles:
+        - !Ref InstanceRole
+
+  InstanceRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      Path: /
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+        - arn:aws:iam::aws:policy/service-role/AmazonEC2ContainerServiceforEC2Role
+
+  InstanceRolePolicy:
+    Type: "AWS::IAM::ManagedPolicy"
+    Properties:
+      Roles:
+        - !Ref InstanceRole
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - 'ec2:Describe*'
+            Resource: '*'
+          - Effect: Allow
+            Action:
+              - 'ec2:CreateTags'
+            Resource:
+              - !Sub 'arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:volume/*'
+              - !Sub 'arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:instance/*'
+
+  ECSAutoScalingGroup:
+    Type: 'AWS::AutoScaling::AutoScalingGroup'
+    Properties:
+      LaunchTemplate:
+        LaunchTemplateId: !Ref ECSLaunchTemplate
+        Version: !GetAtt ECSLaunchTemplate.LatestVersionNumber
+      VPCZoneIdentifier: 
+        - !Ref SubnetIds
+      MinSize: !Ref ASGMinSize
+      MaxSize: !Ref ASGMaxSize
+      DesiredCapacity: !Ref ASGDesiredSize
+      NewInstancesProtectedFromScaleIn: false
+      Tags:
+        -
+          Key: Name
+          Value: !Sub "ECS Instance - ${AWS::StackName}"
+          PropagateAtLaunch: true
+        -
+          Key: Description
+          Value: "This instance is the part of the Auto Scaling group which was created through ECS Console"
+          PropagateAtLaunch: true
+
+  SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Join [ "" , [ 'Managed by CFN Stack: ', !Ref 'AWS::StackName' ] ]
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - Description: Fragmentation Needed
+          IpProtocol: icmp
+          FromPort: 3
+          ToPort: 4
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Ref 'AWS::StackName'
+
+  ECSCluster:
+    Type: 'AWS::ECS::Cluster'
+    Properties:
+      ClusterName: !Ref ECSClusterName
+      ClusterSettings:
+        - Name: containerInsights
+          Value: enabled
+      Configuration:
+        ExecuteCommandConfiguration:
+          Logging: NONE
+          #Logging: DEFAULT
+      Tags:
+        - Key: 'ecs:cluster:createdFrom'
+          Value: ecs-console-v2
+
+  PrivateNamespace:
+    Type: AWS::ServiceDiscovery::PrivateDnsNamespace
+    Properties:
+      Name: demoapp.local
+      Vpc: !Ref VpcId
+
+  FrontendDiscoveryService:
+    Type: AWS::ServiceDiscovery::Service
+    Properties: 
+      Description: DemoApp Route53 Discovery Service
+      DnsConfig:
+        RoutingPolicy: MULTIVALUE
+        DnsRecords:
+          - TTL: 60
+            Type: SRV
+      HealthCheckCustomConfig: 
+        FailureThreshold: 1
+      Name: frontend
+      NamespaceId: !Ref PrivateNamespace
+
+  BackendDiscoveryService:
+    Type: AWS::ServiceDiscovery::Service
+    Properties: 
+      Description: DemoApp Route53 Discovery Service
+      DnsConfig:
+        RoutingPolicy: MULTIVALUE
+        DnsRecords:
+          - TTL: 60
+            Type: SRV
+      HealthCheckCustomConfig: 
+        FailureThreshold: 1
+      Name: backend
+      NamespaceId: !Ref PrivateNamespace
+
+  CloudWatchLogsGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      RetentionInDays: 90
+      LogGroupName: !Join [ "/" , [ /ecs, !Ref 'AWS::StackName' ] ]
+
+  FrontendTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub frontend-${AWS::StackName}
+      NetworkMode: bridge
+      RequiresCompatibilities:
+        - EC2
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt FrontendTaskRole.Arn
+      ContainerDefinitions:
+        - Name: Frontend
+          Image: !Ref FrontendContainerImage
+          Essential: true
+          EntryPoint:
+            - '/bin/sh'
+            - '-c'
+          Command: 
+            - |
+              cat <<'EOF'> /etc/nginx/conf.d/default.conf
+              server_tokens off;
+              server {
+                listen 8080;
+                server_name  _;
+                location / {
+                  default_type text/plain;
+                  expires -1;
+                  return 200 'Client address: $remote_addr $http_x_forwarded_for\nServer address: $server_addr:$server_port\nServer name: $hostname\nDate: $time_local\nURI: $request_uri\nRequest ID: $request_id\n';
+                }
+              }
+              EOF
+              exec nginx -g 'daemon off;'
+          Environment:
+            - Name: BACKEND
+              Value: !Sub https://${BackendHttpApi}.execute-api.${AWS::Region}.amazonaws.com
+          HealthCheck:
+            Command: [ "CMD-SHELL", "curl -fsSL -H 'User-Agent: HealthCheck' http://localhost:8080" ]
+            Interval: 30
+            Timeout: 60
+            StartPeriod: 300
+            Retries: 10
+          Ulimits:
+            - Name: nofile
+              SoftLimit: 1048576
+              HardLimit: 1048576
+          # Memory: !Ref FrontendMemory
+          MemoryReservation: !Ref FrontendMemory
+          # Cpu: !Ref FrontendCpu
+          PortMappings:
+            - ContainerPort: 8080
+              Protocol: tcp
+              HostPort: 0
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref CloudWatchLogsGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: 'ecs'
+
+  TaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+
+  # TaskExecutionRolePolicy:
+  #   Type: "AWS::IAM::ManagedPolicy"
+  #   Properties:
+  #     Roles:
+  #       - !Ref TaskExecutionRole
+  #     PolicyDocument:
+  #       Version: 2012-10-17
+  #       Statement:
+  #         - Sid: ReadOnlyOnSecretManager
+  #           Effect: Allow
+  #           Action:
+  #             - "secretsmanager:GetSecretValue"
+  #           Resource:
+  #             - !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:*"
+
+  FrontendTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+        - arn:aws:iam::aws:policy/AWSXRayDaemonWriteAccess
+
+  FrontendTaskRolePolicy:
+    Type: "AWS::IAM::ManagedPolicy"
+    Properties:
+      Roles:
+        - !Ref FrontendTaskRole
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Sid: EcsExecuteCommand
+            Effect: Allow
+            Action:
+              - "ssmmessages:CreateControlChannel"
+              - "ssmmessages:CreateDataChannel"
+              - "ssmmessages:OpenControlChannel"
+              - "ssmmessages:OpenDataChannel"
+            Resource: "*"
+
+  Frontend:
+    Type: AWS::ECS::Service
+    DependsOn: ECSAutoScalingGroup
+    Properties:
+      TaskDefinition: !Ref FrontendTaskDefinition
+      EnableExecuteCommand: true
+      Cluster: !Ref ECSCluster
+      LaunchType: EC2
+      DesiredCount: 1
+      DeploymentConfiguration:
+        MaximumPercent: 100
+        MinimumHealthyPercent: 0
+        DeploymentCircuitBreaker:
+          Enable: false
+          Rollback: false
+      ServiceRegistries:
+        - RegistryArn: !GetAtt FrontendDiscoveryService.Arn
+          ContainerName: Frontend
+          ContainerPort: 8080
+
+  FrontendVpcLink:  
+    Type: AWS::ApiGatewayV2::VpcLink
+    DependsOn: Frontend
+    Properties: 
+      Name: frontend-apigw-vpclink
+      SecurityGroupIds: 
+        - !Ref FrontendVpcLinkSecurityGroup
+      SubnetIds:
+        - !Ref SubnetIds
+
+  FrontendVpcLinkSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    DependsOn: Frontend
+    Properties:
+      GroupDescription: !Join [ "" , [ 'Managed by CF Stack: ', !Ref 'AWS::StackName' ] ]
+      VpcId: !Ref VpcId
+      Tags:
+        - Key: Name
+          Value: !Ref 'AWS::StackName'
+
+  AddIngressToECSFromFrontendVpcLink:
+    Type: AWS::EC2::SecurityGroupIngress
+    DependsOn: Frontend
+    Properties:
+      Description: Ingress from the Frontend VPC Link
+      IpProtocol: -1
+      SourceSecurityGroupId: !Ref FrontendVpcLinkSecurityGroup
+      GroupId: !Ref SecurityGroup
+
+  FrontendHttpApi:
+    Type: AWS::ApiGatewayV2::Api
+    DependsOn: Frontend
+    Properties:
+      Name: DemoApp-HTTP-frontend
+      Description: DemoApp HTTP API
+      ProtocolType: HTTP
+
+  FrontendAPIRoute:
+    Type: AWS::ApiGatewayV2::Route
+    DependsOn: Frontend
+    Properties:
+      ApiId: !Ref FrontendHttpApi
+      RouteKey: '$default'
+      Target: !Join
+        - /
+        - - integrations
+          - !Ref FrontendAPIIntegration
+
+  FrontendAPIIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    DependsOn: Frontend
+    Properties:
+      ApiId: !Ref FrontendHttpApi
+      Description: CloudMap Integration
+      IntegrationType: HTTP_PROXY
+      IntegrationMethod: ANY
+      ConnectionType: VPC_LINK
+      ConnectionId: !Ref FrontendVpcLink
+      IntegrationUri: !GetAtt FrontendDiscoveryService.Arn
+      PayloadFormatVersion: '1.0'
+  
+  FrontendAPIStage:
+    Type: AWS::ApiGatewayV2::Stage
+    DependsOn: Frontend
+    Properties:
+      StageName: $default
+      AutoDeploy: true
+      ApiId: !Ref FrontendHttpApi
+      AccessLogSettings:
+        DestinationArn: !GetAtt CloudWatchLogsGroup.Arn
+        Format: '{ "ClientCertIssuer": "$context.identity.clientCert.issuerDN", "requestId": "$context.requestId", "ip": "$context.identity.sourceIp", "requestTime": "$context.requestTime", "httpMethod": "$context.httpMethod", "routeKey": "$context.routeKey", "status": "$context.status", "protocol": "$context.protocol", "responseLength": "$context.responseLength", "Path": "$context.path" }'
+
+  BackendTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub backend-${AWS::StackName}
+      NetworkMode: bridge
+      RequiresCompatibilities:
+        - EC2
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt BackendTaskRole.Arn
+      ContainerDefinitions:
+        - Name: Backend
+          Image: !Ref BackendContainerImage
+          Essential: true
+          EntryPoint:
+            - '/bin/sh'
+            - '-c'
+          Command: 
+            - |
+              cat <<'EOF'> /etc/nginx/conf.d/default.conf
+              server_tokens off;
+              server {
+                listen 8000;
+                server_name  _;
+                location / {
+                  default_type text/plain;
+                  expires -1;
+                  return 200 'Client address: $remote_addr $http_x_forwarded_for\nServer address: $server_addr:$server_port\nServer name: $hostname\nDate: $time_local\nURI: $request_uri\nRequest ID: $request_id\n';
+                }
+              }
+              EOF
+              exec nginx -g 'daemon off;'
+          Environment:
+            - Name: DEMOAPP_S3_BUCKET
+              Value: !Ref S3Bucket
+          HealthCheck:
+            Command: [ "CMD-SHELL", "curl -fsSL -H 'User-Agent: HealthCheck' http://localhost:8000" ]
+            Interval: 30
+            Timeout: 5
+            StartPeriod: 120
+            Retries: 3
+          Ulimits:
+            - Name: nofile
+              SoftLimit: 1048576
+              HardLimit: 1048576
+          # Memory: !Ref BackendMemory
+          MemoryReservation: !Ref BackendMemory
+          # Cpu: !Ref BackendCpu
+          PortMappings:
+            - ContainerPort: 8000
+              Protocol: tcp
+              HostPort: 0
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref CloudWatchLogsGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: 'ecs'
+
+  BackendTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+        - arn:aws:iam::aws:policy/AWSXRayDaemonWriteAccess
+        - arn:aws:iam::aws:policy/AWSCloudTrail_ReadOnlyAccess
+
+  BackendTaskRolePolicy:
+    Type: "AWS::IAM::ManagedPolicy"
+    Properties:
+      Roles:
+        - !Ref BackendTaskRole
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Sid: EcsExecuteCommand
+            Effect: Allow
+            Action:
+              - "ssmmessages:CreateControlChannel"
+              - "ssmmessages:CreateDataChannel"
+              - "ssmmessages:OpenControlChannel"
+              - "ssmmessages:OpenDataChannel"
+            Resource: "*"
+          - Sid: S3Bucket
+            Effect: Allow
+            Action:
+              - s3:*
+            Resource:
+              - !Sub arn:aws:s3:::${S3Bucket}
+              - !Sub arn:aws:s3:::${S3Bucket}/*
+
+  S3Bucket:
+    Type: 'AWS::S3::Bucket'
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      AccessControl: Private
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration :
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+          # - ServerSideEncryptionByDefault:
+          #     SSEAlgorithm: aws:kms
+          #     KMSMasterKeyID: !Sub arn:aws:kms:${AWS::Region}:${AWS::AccountId}:alias/aws/s3
+          #   BucketKeyEnabled: true
+
+  Backend:
+    Type: AWS::ECS::Service
+    DependsOn: ECSAutoScalingGroup
+    Properties:
+      TaskDefinition: !Ref BackendTaskDefinition
+      EnableExecuteCommand: true
+      Cluster: !Ref ECSCluster
+      LaunchType: EC2
+      DesiredCount: 1
+      DeploymentConfiguration:
+        MaximumPercent: 100
+        MinimumHealthyPercent: 0
+        DeploymentCircuitBreaker:
+          Enable: false
+          Rollback: false
+      ServiceRegistries:
+        - RegistryArn: !GetAtt BackendDiscoveryService.Arn
+          ContainerName: Backend
+          ContainerPort: 8000
+
+  BackendVpcLink:  
+    Type: AWS::ApiGatewayV2::VpcLink
+    DependsOn: Backend
+    Properties: 
+      Name: backend-apigw-vpclink
+      SecurityGroupIds: 
+        - !Ref BackendVpcLinkSecurityGroup
+      SubnetIds: 
+        - !Ref SubnetIds
+
+  BackendVpcLinkSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    DependsOn: Backend
+    Properties:
+      GroupDescription: !Join [ "" , [ 'Managed by CF Stack: ', !Ref 'AWS::StackName' ] ]
+      VpcId: !Ref VpcId
+      Tags:
+        - Key: Name
+          Value: !Ref 'AWS::StackName'
+
+  AddIngressToECSFromBackendVpcLink:
+    Type: AWS::EC2::SecurityGroupIngress
+    DependsOn: Backend
+    Properties:
+      Description: Ingress from the Backend VPC Link
+      IpProtocol: -1
+      SourceSecurityGroupId: !Ref BackendVpcLinkSecurityGroup
+      GroupId: !Ref SecurityGroup
+
+  BackendHttpApi:
+    Type: AWS::ApiGatewayV2::Api
+    DependsOn: Backend
+    Properties:
+      Name: DemoApp-HTTP-backend
+      Description: DemoApp HTTP API
+      ProtocolType: HTTP
+
+  BackendAPIRoute:
+    Type: AWS::ApiGatewayV2::Route
+    DependsOn: Backend
+    Properties:
+      ApiId: !Ref BackendHttpApi
+      RouteKey: '$default'
+      Target: !Join
+        - /
+        - - integrations
+          - !Ref BackendAPIIntegration
+
+  BackendAPIIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    DependsOn: Backend
+    Properties:
+      ApiId: !Ref BackendHttpApi
+      Description: CloudMap Integration
+      IntegrationType: HTTP_PROXY
+      IntegrationMethod: ANY
+      ConnectionType: VPC_LINK
+      ConnectionId: !Ref BackendVpcLink
+      IntegrationUri: !GetAtt BackendDiscoveryService.Arn
+      PayloadFormatVersion: '1.0'
+  
+  BackendAPIStage:
+    Type: AWS::ApiGatewayV2::Stage
+    DependsOn: Backend
+    Properties:
+      StageName: $default
+      AutoDeploy: true
+      ApiId: !Ref BackendHttpApi
+      AccessLogSettings:
+        DestinationArn: !GetAtt CloudWatchLogsGroup.Arn
+        Format: '{ "ClientCertIssuer": "$context.identity.clientCert.issuerDN", "requestId": "$context.requestId", "ip": "$context.identity.sourceIp", "requestTime": "$context.requestTime", "httpMethod": "$context.httpMethod", "routeKey": "$context.routeKey", "status": "$context.status", "protocol": "$context.protocol", "responseLength": "$context.responseLength", "Path": "$context.path" }'
+
+  CodeBuild:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Ref ProjectName
+      Description: !Ref ProjectName
+      ServiceRole: !GetAtt CodeBuildRole.Arn
+      #EncryptionKey: !ImportValue CodePipelineKMSKeyArn
+      Artifacts:
+        Type: CODEPIPELINE
+      Source:
+        Type: CODEPIPELINE
+        # Type: NO_SOURCE
+        #Location: !Sub https://git-codecommit.${AWS::Region}.amazonaws.com/v1/repos/${RepositoryName}
+        GitCloneDepth: 0
+        #BuildSpec: codebuild/buildspec.yaml
+        BuildSpec: !Sub |
+          version: 0.2
+          env:
+            git-credential-helper: yes
+            shell: bash
+            variables:
+              IMAGE_NAME: "${ProjectName}"
+              COMMIT_HASH: ""
+              VERSION: ""
+              ChangeSetName: ""
+              CloudFormationStackNameDev: "dev-${ProjectName}"
+              CloudFormationTemplateFile: "cfn-ecs-deploy.yaml"
+              CloudFormationConfigFileDev: "cfn-ecs-deploy-parameters-dev.json"
+              CloudFormationParameterOverrides: "cfn-parameters-overrides.json"
+            exported-variables:
+              - IMAGE_NAME
+              - COMMIT_HASH
+              - VERSION
+              - ChangeSetName
+              - CloudFormationStackNameDev
+              - CloudFormationTemplateFile
+              - CloudFormationConfigFileDev
+              - CloudFormationParameterOverrides
+          phases:
+            install:
+              on-failure: ABORT
+              commands:
+                - |
+                  set -ex
+                  echo $BranchName
+                  exit 1
+                  git -C . rev-parse --verify --short=8 HEAD
+                - |
+                  printf "\n[ Install Tools ]\n"
+                  apt-get -q update
+                  apt-get -q -y install jq
+                - |
+                  printf "\n[ Install Trivy ]\n"
+                  TRIVY_VERSION=0.29.2
+                  curl -fsSL https://github.com/aquasecurity/trivy/releases/download/v$TRIVY_VERSION/trivy_"$TRIVY_VERSION"_Linux-64bit.deb \
+                    -o trivy_"$TRIVY_VERSION"_Linux-64bit.deb
+                  curl -fsSL https://github.com/aquasecurity/trivy/releases/download/v$TRIVY_VERSION/trivy_"$TRIVY_VERSION"_checksums.txt | \
+                    grep trivy_"$TRIVY_VERSION"_Linux-64bit.deb | sha256sum -c - || exit 1
+                  dpkg -i trivy_"$TRIVY_VERSION"_Linux-64bit.deb
+            pre_build:
+              on-failure: ABORT
+              commands:
+                - |
+                  printf "\n[ Environment Variables ]\n"
+                  AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+                  COMMIT_HASH=$(git -C . rev-parse --verify --short=8 HEAD)
+                  REPOSITORY_URI=$AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$IMAGE_NAME
+                  IMAGE_TAG=$COMMIT_HASH
+                  VERSION=$COMMIT_HASH
+                  TRIVY_CACHE_DIR=/tmp/build_cache/trivy
+                - |
+                  printf "\n[ Docker login to Amazon ECR with awscli_v2 ]\n"
+                  aws ecr get-login-password --region $AWS_DEFAULT_REGION | \
+                    docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com
+                - |
+                  printf "\n[ Create image repo if it doesn't exist... ]\n"
+                  if [ ! $(aws ecr describe-repositories --repository-name $IMAGE_NAME >/dev/null 2>&1) ]; then
+                    aws ecr create-repository --repository-name $IMAGE_NAME;
+                    aws ecr set-repository-policy --repository-name $IMAGE_NAME --policy-text file://ecr/policy.json;
+                  fi
+            build:
+              on-failure: ABORT
+              commands:
+                - |
+                  printf "\n[ Build Started on `date` ]\n"
+                  docker build --progress=plain \
+                    --tag $REPOSITORY_URI:$IMAGE_TAG \
+                    --tag $REPOSITORY_URI:$VERSION \
+                    --tag $REPOSITORY_URI:latest \
+                    . -f codebuild/Dockerfile
+                - |
+                  printf "\n[ Scan Started on `date` ]\n"
+                  trivy image \
+                    --ignore-unfixed \
+                    --severity HIGH,CRITICAL \
+                    --security-checks vuln \
+                    --vuln-type os,library \
+                    --exit-code 0 \
+                    --insecure \
+                    $REPOSITORY_URI:latest
+            post_build:
+              on-failure: ABORT
+              commands:
+                - |
+                  set -ex
+                  printf "\n[ Push to ECR ]\n"
+                  docker push --all-tags $REPOSITORY_URI
+                - |
+                  set -ex
+                  printf "\n[ CloudFormation ChangeSet ]\n"
+                  if [ "$VERSION" == "" ]; then VERSION=$COMMIT_HASH; fi
+                  ChangeSetName=version-$(echo $VERSION | sed "s/\./\-/g")
+                - |
+                  set -ex
+                  printf "\n[ Writing image definitions file... ]\n"
+                  printf '{"imageUri":"%s"}' "$REPOSITORY_URI:$IMAGE_TAG" | \
+                    tee cloudformation/$CloudFormationParameterOverrides
+          artifacts:
+            files:
+              - '**/*'
+            base-directory: 'cloudformation'
+            discard-paths: yes
+      SourceVersion: !Sub refs/heads/${RepositoryBranch}
+      TimeoutInMinutes: 10
+      Environment:
+        ComputeType: BUILD_GENERAL1_SMALL
+        Type: LINUX_CONTAINER
+        Image: aws/codebuild/standard:6.0
+        ImagePullCredentialsType: CODEBUILD
+        PrivilegedMode: True
+        EnvironmentVariables:
+          - Name: PipelineName
+            Type: PLAINTEXT
+            Value: !Sub '${ProjectName}'
+          - Name: CodePipelineS3BucketName
+            Type: PLAINTEXT
+            Value: !Ref ArtifactsBucket
+          - Name: BranchName
+            Type: PLAINTEXT
+            Value: '#{SourceVariables.BranchName}'
+      # VpcConfig:
+      #   SecurityGroupIds:
+      #     - !ImportValue CodeBuildSecurityGroupId
+      #   Subnets: !Split [',', !Join [',', !Ref PrivateSubnetIds]]
+      #   VpcId: !Ref VPC
+      LogsConfig:
+        CloudWatchLogs:
+          GroupName: !Ref CodeBuildLogsGroup
+          Status: ENABLED
+      # Cache:
+      #   Type: S3
+      #   Location: !Join [ "/" , [ !ImportValue CodePipelineS3BucketName, !Ref ProjectName, BuildCache ] ]
+      #   Type: LOCAL
+      #   Modes:
+      #     - LOCAL_CUSTOM_CACHE
+
+  CodeBuildLogsGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      RetentionInDays: 7
+      LogGroupName: !Join [ "/" , [ /aws/codebuild, !Ref 'ProjectName' ] ]
+
+  ArtifactsBucket:
+    Type: 'AWS::S3::Bucket'
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      AccessControl: Private
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration :
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+          # - ServerSideEncryptionByDefault:
+          #     SSEAlgorithm: aws:kms
+          #     KMSMasterKeyID: !Sub arn:aws:kms:${AWS::Region}:${AWS::AccountId}:alias/aws/s3
+          #   BucketKeyEnabled: true
+
+  CodeBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub CodeBuildRole-${AWS::StackName}
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - codebuild.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: /
+      # ManagedPolicyArns:
+      #   - !Sub arn:${AWS::Partition}:iam::aws:policy/AdministratorAccess
+      Policies:
+        - PolicyName: !Sub CodeBuildPolicy-${AWS::StackName}
+          PolicyDocument: !Sub |
+            {
+              "Version": "2012-10-17",
+              "Statement": [
+                {
+                  "Effect": "Allow",
+                  "Resource": [
+                    "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/${ProjectName}",
+                    "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/${ProjectName}:*"
+                  ],
+                  "Action": [
+                    "logs:CreateLogGroup",
+                    "logs:CreateLogStream",
+                    "logs:PutLogEvents"
+                  ]
+                },
+                {
+                  "Effect": "Allow",
+                  "Resource": [
+                    "${ArtifactsBucket.Arn}"
+                  ],
+                  "Action": [
+                    "s3:PutObject",
+                    "s3:GetObject",
+                    "s3:GetObjectVersion",
+                    "s3:GetBucketAcl",
+                    "s3:GetBucketLocation"
+                  ]
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "codebuild:CreateReportGroup",
+                    "codebuild:CreateReport",
+                    "codebuild:UpdateReport",
+                    "codebuild:BatchPutTestCases",
+                    "codebuild:BatchPutCodeCoverages"
+                  ],
+                  "Resource": [
+                    "arn:aws:codebuild:${AWS::Region}:${AWS::AccountId}:report-group/${ProjectName}-*"
+                  ]
+                }
+              ]
+            }
+
+  CodePipelineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub CodePipelineRole-${AWS::StackName}
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+        - Effect: Allow
+          Action:
+            - sts:AssumeRole
+          Principal:
+            Service:
+              # Only CodePipeline service can assume this role
+              # No one else can assume this role
+              - codepipeline.amazonaws.com
+      Path: /
+      # ManagedPolicyArns:
+      #   - !Sub arn:${AWS::Partition}:iam::aws:policy/AdministratorAccess
+      Policies:
+        - PolicyName: !Sub CodePipelinePolicy-${AWS::StackName}
+          PolicyDocument: |
+            {
+              "Version": "2012-10-17",
+              "Statement": [
+                {
+                  "Action": [
+                    "iam:PassRole"
+                  ],
+                  "Resource": "*",
+                  "Effect": "Allow",
+                  "Condition": {
+                    "StringEqualsIfExists": {
+                      "iam:PassedToService": [
+                        "cloudformation.amazonaws.com",
+                        "elasticbeanstalk.amazonaws.com",
+                        "ec2.amazonaws.com",
+                        "ecs-tasks.amazonaws.com"
+                      ]
+                    }
+                  }
+                },
+                {
+                  "Action": [
+                    "codecommit:CancelUploadArchive",
+                    "codecommit:GetBranch",
+                    "codecommit:GetCommit",
+                    "codecommit:GetRepository",
+                    "codecommit:GetUploadArchiveStatus",
+                    "codecommit:UploadArchive"
+                  ],
+                  "Resource": "*",
+                  "Effect": "Allow"
+                },
+                {
+                  "Action": [
+                    "codedeploy:CreateDeployment",
+                    "codedeploy:GetApplication",
+                    "codedeploy:GetApplicationRevision",
+                    "codedeploy:GetDeployment",
+                    "codedeploy:GetDeploymentConfig",
+                    "codedeploy:RegisterApplicationRevision"
+                  ],
+                  "Resource": "*",
+                  "Effect": "Allow"
+                },
+                {
+                  "Action": [
+                    "codestar-connections:UseConnection"
+                  ],
+                  "Resource": "*",
+                  "Effect": "Allow"
+                },
+                {
+                  "Action": [
+                    "elasticbeanstalk:*",
+                    "ec2:*",
+                    "elasticloadbalancing:*",
+                    "autoscaling:*",
+                    "cloudwatch:*",
+                    "s3:*",
+                    "sns:*",
+                    "cloudformation:*",
+                    "rds:*",
+                    "sqs:*",
+                    "ecs:*"
+                  ],
+                  "Resource": "*",
+                  "Effect": "Allow"
+                },
+                {
+                  "Action": [
+                    "lambda:InvokeFunction",
+                    "lambda:ListFunctions"
+                  ],
+                  "Resource": "*",
+                  "Effect": "Allow"
+                },
+                {
+                  "Action": [
+                    "opsworks:CreateDeployment",
+                    "opsworks:DescribeApps",
+                    "opsworks:DescribeCommands",
+                    "opsworks:DescribeDeployments",
+                    "opsworks:DescribeInstances",
+                    "opsworks:DescribeStacks",
+                    "opsworks:UpdateApp",
+                    "opsworks:UpdateStack"
+                  ],
+                  "Resource": "*",
+                  "Effect": "Allow"
+                },
+                {
+                  "Action": [
+                    "cloudformation:CreateStack",
+                    "cloudformation:DeleteStack",
+                    "cloudformation:DescribeStacks",
+                    "cloudformation:UpdateStack",
+                    "cloudformation:CreateChangeSet",
+                    "cloudformation:DeleteChangeSet",
+                    "cloudformation:DescribeChangeSet",
+                    "cloudformation:ExecuteChangeSet",
+                    "cloudformation:SetStackPolicy",
+                    "cloudformation:ValidateTemplate"
+                  ],
+                  "Resource": "*",
+                  "Effect": "Allow"
+                },
+                {
+                  "Action": [
+                    "codebuild:BatchGetBuilds",
+                    "codebuild:StartBuild",
+                    "codebuild:BatchGetBuildBatches",
+                    "codebuild:StartBuildBatch"
+                  ],
+                  "Resource": "*",
+                  "Effect": "Allow"
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "devicefarm:ListProjects",
+                    "devicefarm:ListDevicePools",
+                    "devicefarm:GetRun",
+                    "devicefarm:GetUpload",
+                    "devicefarm:CreateUpload",
+                    "devicefarm:ScheduleRun"
+                  ],
+                  "Resource": "*"
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "servicecatalog:ListProvisioningArtifacts",
+                    "servicecatalog:CreateProvisioningArtifact",
+                    "servicecatalog:DescribeProvisioningArtifact",
+                    "servicecatalog:DeleteProvisioningArtifact",
+                    "servicecatalog:UpdateProduct"
+                  ],
+                  "Resource": "*"
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "cloudformation:ValidateTemplate"
+                  ],
+                  "Resource": "*"
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "ecr:DescribeImages"
+                  ],
+                  "Resource": "*"
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "states:DescribeExecution",
+                    "states:DescribeStateMachine",
+                    "states:StartExecution"
+                  ],
+                  "Resource": "*"
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "appconfig:StartDeployment",
+                    "appconfig:StopDeployment",
+                    "appconfig:GetDeployment"
+                  ],
+                  "Resource": "*"
+                }
+              ]
+            }
+
+  CloudWatchPipelineTriggerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub CloudWatch-Pipeline-Trigger-${AWS::StackName}
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - events.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: !Sub CloudWatch-Pipeline-Trigger-Policy-${AWS::StackName}
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - codepipeline:StartPipelineExecution
+                Resource: # Allow CloudWatch to trigger any pipeline
+                  - !Sub arn:aws:codepipeline:${AWS::Region}:${AWS::AccountId}:*
+
+  CloudFormationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: CloudFormationRole
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - cloudformation.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: /
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/AdministratorAccess
+
+  SourceConnection:
+    Type: 'AWS::CodeStarConnections::Connection'
+    Properties:
+      ConnectionName: !Sub GitHubConnection-${AWS::StackName}
+      ProviderType: GitHub
+
+  CodePipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      Name: !Ref ProjectName
+      RestartExecutionOnUpdate: False
+      ArtifactStore:
+        Type: S3
+        Location: !Ref ArtifactsBucket
+        # EncryptionKey:
+        #   Id: !Sub arn:aws:kms:${AWS::Region}:${AWS::AccountId}:alias/aws/s3
+        #   Type: "KMS"
+      RoleArn: !GetAtt CodePipelineRole.Arn
+      Stages:
+        # - Name: Source
+        #   Actions:
+        #     - Name: Source
+        #       RunOrder: 1
+        #       ActionTypeId:
+        #         Category: Source
+        #         Owner: AWS
+        #         Provider: CodeCommit
+        #         Version: "1"
+        #       Configuration:
+        #         RepositoryName: !Ref RepositoryName
+        #         PollForSourceChanges: 'false'
+        #         BranchName: !Ref RepositoryBranch
+        #         OutputArtifactFormat: 'CODEBUILD_CLONE_REF'
+        #       Namespace: SourceVariables
+        #       OutputArtifacts:
+        #         - Name: source_out
+        - Name: Source
+          Actions:
+            - Name: Source
+              RunOrder: 1
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Provider: CodeStarSourceConnection
+                Version: "1"
+              Configuration:
+                ConnectionArn: !Ref SourceConnection
+                FullRepositoryId: !Sub ${RepositoryOwner}/${RepositoryName}
+                PollForSourceChanges: 'false'
+                BranchName: !Ref RepositoryBranch
+                OutputArtifactFormat: 'CODEBUILD_CLONE_REF'
+                #OutputArtifactFormat: 'CODE_ZIP'
+              Namespace: SourceVariables
+              OutputArtifacts:
+                - Name: source_out
+        - Name: Build
+          Actions:
+            - Name: Build
+              RunOrder: 1
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: "1"
+              Configuration:
+                ProjectName: !Ref CodeBuild
+              Namespace: BuildVariables
+              InputArtifacts:
+                - Name: source_out
+              OutputArtifacts:
+                - Name: build_out
+        # - Name: Deploy-DEV
+        #   Actions:
+        #     - Name: ApplyChange
+        #       RunOrder: 2
+        #       Region: !Ref AWS::Region
+        #       ActionTypeId:
+        #         Category: Deploy
+        #         Owner: AWS
+        #         Provider: CloudFormation
+        #         Version: "1"
+        #       Configuration:
+        #         #ChangeSetName: !Sub version-${AppVersion}
+        #         #ActionMode: CHANGE_SET_REPLACE
+        #         ActionMode: CREATE_UPDATE
+        #         Capabilities: CAPABILITY_IAM
+        #         StackName: !Sub ${CloudFormationStackNameDev}
+        #         TemplatePath: !Sub build_out::${CloudFormationTemplateFile}
+        #         TemplateConfiguration: !Sub build_out::${CloudFormationConfigFileDev}
+        #         ParameterOverrides: |
+        #           {"EcsImageUri" : 
+        #             { "Fn::GetParam" : [ "build_out", "cf-parameters-overrides.json", "imageUri" ] }
+        #           }
+        #         RoleArn: !ImportValue CloudFormationRoleArn
+        #       InputArtifacts:
+        #         - Name: build_out
+        #       OutputArtifacts: []
+
+  CodeCheckinCloudWatchEvent:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: CloudWatch event rule to trigger CICD pipeline upon code check into code commit repo
+      EventPattern:
+        source:
+          - aws.codecommit
+        detail-type:
+          - "CodeCommit Repository State Change"
+        resources:
+          - !Sub arn:aws:codecommit:${AWS::Region}:${AWS::AccountId}:${RepositoryName}
+        detail:
+          event:
+            - referenceCreated
+            - referenceUpdated
+          referenceType:
+            - branch
+          referenceName:
+            - !Ref RepositoryBranch
+      Name: !Ref AWS::StackName
+      State: ENABLED
+      Targets:
+        -
+          Arn: !Sub arn:aws:codepipeline:${AWS::Region}:${AWS::AccountId}:${CodePipeline}
+          RoleArn: !ImportValue CloudWatchPipelineTriggerRoleArn
+          Id: !Ref AWS::StackName
+
+Outputs:
+  FrontendAPIGWURL:
+    Description: Frontend URL
+    Value: !Sub https://${FrontendHttpApi}.execute-api.${AWS::Region}.amazonaws.com/
+  BackendAPIGWURL:
+    Description: Backend URL
+    Value: !Sub https://${BackendHttpApi}.execute-api.${AWS::Region}.amazonaws.com/
+  S3Bucket:
+    Value: !Sub https://s3.console.aws.amazon.com/s3/buckets/${S3Bucket}?region=${AWS::Region}&tab=objects
+    Description: DemoApp S3 Bucket
+  OutCodePipeline:
+    Description: CICD Pipeline Name
+    Value: !Ref CodePipeline
+  OutCodePipelineURL:
+    Value: !Sub "https://console.aws.amazon.com/codepipeline/home?region=${AWS::Region}#/view/${CodePipeline}"
+    Export:
+      Name: !Sub CodePipelineURL-${AWS::StackName}
